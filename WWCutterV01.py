@@ -81,6 +81,8 @@ class HotWireController(QMainWindow):
         origin_layout.addWidget(QLabel("V:"))
         self.origin_v = QDoubleSpinBox(); self.origin_v.setRange(-2000, 2000)
         origin_layout.addWidget(self.origin_v)
+        for box in (self.origin_x, self.origin_y, self.origin_u, self.origin_v):
+            box.valueChanged.connect(self.update_preview)
         
         layout.addLayout(origin_layout)
                 
@@ -102,30 +104,27 @@ class HotWireController(QMainWindow):
         self.speed_box.valueChanged.connect(self.update_speed)
         self.speed_box.valueChanged.connect(self.update_time_estimate)
 
-        # --- NEW: Rotation & Preview ---
         rot_layout = QHBoxLayout()
         rot_layout.addWidget(QLabel("DXF Rotation (Degrees):"))
         self.rot_combo = QComboBox()
         self.rot_combo.addItems(["0", "90", "180", "270"])
         self.rot_combo.currentTextChanged.connect(self.update_preview)
         self.rot_combo.currentTextChanged.connect(self.update_time_estimate)
-        
-        # --- NEW: Rotation & Preview ---
-        rot_layout = QHBoxLayout()
-        rot_layout.addWidget(QLabel("DXF Rotation (Degrees):"))
-        self.rot_combo = QComboBox()
-        self.rot_combo.addItems(["0", "90", "180", "270"])
-        self.rot_combo.currentTextChanged.connect(self.update_preview)
         rot_layout.addWidget(self.rot_combo)
         layout.addLayout(rot_layout)
         
-        layout.addWidget(QLabel("Toolpath Preview (Red Dot = Job Origin):"))
+        layout.addWidget(QLabel("Toolpath Preview (XY = green, UV = blue):"))
         self.preview_label = QLabel("Load a DXF to preview")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumHeight(250)
         self.preview_label.setStyleSheet("background-color: #1e1e1e; color: #aaa; border: 1px solid #444;")
         layout.addWidget(self.preview_label)
-        # -------------------------------
+        self.preview_move = QSlider(Qt.Orientation.Horizontal)
+        self.preview_move.valueChanged.connect(self.update_preview)
+        self.preview_move.setEnabled(False)
+        layout.addWidget(self.preview_move)
+        self.preview_coords = QLabel("Move: -   X: -   Y: -   U: -   V: -")
+        layout.addWidget(self.preview_coords)
         
         speed_layout.addWidget(self.speed_slider)
         speed_layout.addWidget(self.speed_box)
@@ -264,18 +263,23 @@ class HotWireController(QMainWindow):
         return rotated
 
     def update_preview(self):
-        if not self.dxf_a: return
-        
-        points = self.get_dxf_points(self.dxf_a)
-        if not points: return
-        
-        angle = int(self.rot_combo.currentText())
-        points = self.process_toolpath(points, angle) # <-- Replaces rotate_points
-        
+        if not (self.dxf_a and self.dxf_b): return
+        paths = self.get_job_toolpaths()
+        if not all(paths): return
+        moves = self.get_machine_moves(*paths)
+        if not moves: return
+        draw_paths = [[(m[a] / self.STEPS_PER_MM, m[a + 1] / self.STEPS_PER_MM) for m in moves]
+                      for a in (0, 2)]
+        points = draw_paths[0] + draw_paths[1]
+        move_count = len(moves)
+        self.preview_move.setEnabled(True)
+        self.preview_move.setMaximum(max(0, move_count - 1))
+
         min_x, max_x = min(p[0] for p in points), max(p[0] for p in points)
         min_y, max_y = min(p[1] for p in points), max(p[1] for p in points)
         width, height = max_x - min_x, max_y - min_y
-        if width == 0 or height == 0: return
+        if width == 0: width = 1
+        if height == 0: height = 1
         
         cw, ch, padding = 600, 250, 20
         scale = min((cw - padding*2) / width, (ch - padding*2) / height)
@@ -285,29 +289,36 @@ class HotWireController(QMainWindow):
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        screen_pts = []
-        for x, y in points:
-            sx = padding + (x - min_x) * scale
-            sy = ch - padding - (y - min_y) * scale
-            screen_pts.append((sx, sy))
-            
-        for i in range(1, len(screen_pts)):
-            if i == 1:
-                painter.setPen(QPen(QColor(0, 100, 255), 2)) # Blue lead-in
-            else:
-                painter.setPen(QPen(QColor(0, 255, 100), 2)) # Green cut path
-                
-            painter.drawLine(int(screen_pts[i-1][0]), int(screen_pts[i-1][1]), 
-                             int(screen_pts[i][0]), int(screen_pts[i][1]))
-                             
-        origin_x = padding + (min_x - min_x) * scale
-        origin_y = ch - padding - (min_y - min_y) * scale
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(255, 50, 50))
-        painter.drawEllipse(int(origin_x) - 6, int(origin_y) - 6, 12, 12)
+        screen = lambda p: (padding + (p[0] - min_x) * scale,
+                            ch - padding - (p[1] - min_y) * scale)
+        for toolpath, color in zip(draw_paths, (QColor(0, 255, 100), QColor(0, 160, 255))):
+            painter.setPen(QPen(color, 2))
+            for p1, p2 in zip(toolpath, toolpath[1:]):
+                painter.drawLine(*map(int, (*screen(p1), *screen(p2))))
+            if toolpath:
+                painter.setBrush(color); painter.setPen(Qt.PenStyle.NoPen)
+                x, y = screen(toolpath[min(self.preview_move.value(), len(toolpath) - 1)])
+                painter.drawEllipse(int(x) - 5, int(y) - 5, 10, 10)
+
+        i = self.preview_move.value()
+        if i < move_count:
+            x, y, u, v = (n / self.STEPS_PER_MM for n in moves[i])
+            self.preview_coords.setText(f"Move {i + 1}/{move_count}   X: {x:.2f}   Y: {y:.2f}   U: {u:.2f}   V: {v:.2f} mm")
         
         painter.end()
         self.preview_label.setPixmap(pixmap)
+
+    def get_job_toolpaths(self):
+        angle = int(self.rot_combo.currentText())
+        return [self.process_toolpath(self.get_dxf_points(f), angle) for f in (self.dxf_a, self.dxf_b)]
+
+    def get_machine_moves(self, points_a, points_b):
+        origins = [int(box.value() * self.STEPS_PER_MM) for box in
+                   (self.origin_x, self.origin_y, self.origin_u, self.origin_v)]
+        mins = [min(p[a] for p in points) for points in (points_a, points_b) for a in (0, 1)]
+        return [tuple(int((p[a] - mins[j]) * self.STEPS_PER_MM) + origins[j]
+                      for j, (p, a) in enumerate(((pa, 0), (pa, 1), (pb, 0), (pb, 1))))
+                for pa, pb in zip(points_a, points_b)]
         
     def process_toolpath(self, points, angle):
         if not points: return []
@@ -422,32 +433,13 @@ class HotWireController(QMainWindow):
     def start_job(self):
         if not (self.dxf_a and self.dxf_b and self.serial_conn): return
         
-        # 1. EXTRACT THE POINTS
-        points_a = self.get_dxf_points(self.dxf_a)
-        points_b = self.get_dxf_points(self.dxf_b)
+        points_a, points_b = self.get_job_toolpaths()
         
         if not points_a or not points_b:
             self.set_status("Error: Empty or invalid DXF profile")
             return
             
-        # 2. GET THE ANGLE
-        angle = int(self.rot_combo.currentText())
-        
-        # 3. PROCESS THE TOOLPATH
-        points_a = self.process_toolpath(points_a, angle)
-        points_b = self.process_toolpath(points_b, angle)
-            
         self.set_status("Calculating Toolpath Dynamics...")
-        
-        cad_origin_a_x = min(p[0] for p in points_a)
-        cad_origin_a_y = min(p[1] for p in points_a)
-        cad_origin_b_x = min(p[0] for p in points_b)
-        cad_origin_b_y = min(p[1] for p in points_b)
-        
-        orig_x_steps = int(self.origin_x.value() * self.STEPS_PER_MM)
-        orig_y_steps = int(self.origin_y.value() * self.STEPS_PER_MM)
-        orig_u_steps = int(self.origin_u.value() * self.STEPS_PER_MM)
-        orig_v_steps = int(self.origin_v.value() * self.STEPS_PER_MM)
 
         smoothed_speeds = self.calculate_dynamic_speeds(points_a)
         self.calculate_estimate(points_a, points_b, smoothed_speeds)
@@ -455,13 +447,7 @@ class HotWireController(QMainWindow):
         self.serial_conn.write(f"UPLOAD,{len(points_a)}\n".encode())
         self.set_status("Uploading...")
         
-        min_len = min(len(points_a), len(points_b))
-        for i in range(min_len):
-            x = int((points_a[i][0] - cad_origin_a_x) * self.STEPS_PER_MM) + orig_x_steps
-            y = int((points_a[i][1] - cad_origin_a_y) * self.STEPS_PER_MM) + orig_y_steps
-            u = int((points_b[i][0] - cad_origin_b_x) * self.STEPS_PER_MM) + orig_u_steps
-            v = int((points_b[i][1] - cad_origin_b_y) * self.STEPS_PER_MM) + orig_v_steps
-            
+        for i, (x, y, u, v) in enumerate(self.get_machine_moves(points_a, points_b)):
             self.serial_conn.write(f"QUEUE,{x},{y},{u},{v},{smoothed_speeds[i]}\n".encode())
             
             if i > 0:

@@ -366,6 +366,7 @@ class HotWireController(QMainWindow):
             while paths:
                 curr_end = stitched[-1]
                 curr_start = stitched[0]
+                paths.sort(key=lambda p: min(np.hypot(p[0][0]-curr_end[0], p[0][1]-curr_end[1]), np.hypot(p[-1][0]-curr_end[0], p[-1][1]-curr_end[1]), np.hypot(p[-1][0]-curr_start[0], p[-1][1]-curr_start[1]), np.hypot(p[0][0]-curr_start[0], p[0][1]-curr_start[1])))
                 found = False
                 
                 for i, p in enumerate(paths):
@@ -383,8 +384,10 @@ class HotWireController(QMainWindow):
                         paths.pop(i); found = True; break
                         
                 if not found:
-                    # If there's a hard gap, force the jump
-                    stitched.extend(paths.pop(0))
+                    # Bridge a hard gap to the nearest remaining endpoint.
+                    i = min(range(len(paths)), key=lambda i: min(np.hypot(paths[i][0][0]-curr_end[0], paths[i][0][1]-curr_end[1]), np.hypot(paths[i][-1][0]-curr_end[0], paths[i][-1][1]-curr_end[1])))
+                    p = paths.pop(i)
+                    stitched.extend(p if np.hypot(p[0][0]-curr_end[0], p[0][1]-curr_end[1]) <= np.hypot(p[-1][0]-curr_end[0], p[-1][1]-curr_end[1]) else p[::-1])
             
             # REMOVED old is_closed logic. Just return the array.
             return [tuple(x) for x in stitched]

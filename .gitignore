@@ -1,0 +1,11 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Editor-specific settings
+.vscode/
+.DS_Store
+
+# Generated DXF files, except files whose names start with "text"
+*.dxf
+!text*.dxf

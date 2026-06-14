@@ -4,6 +4,7 @@ __pycache__/
 
 # Editor-specific settings
 .vscode/
+.DS_Store
 
 # Generated DXF files, except files whose names start with "text"
 *.dxf

@@ -3,10 +3,9 @@ import time
 import numpy as np
 import serial.tools.list_ports
 import ezdxf
-from ezdxf import path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, 
                              QWidget, QSlider, QLabel, QFileDialog, QHBoxLayout, 
-                             QDoubleSpinBox, QSpinBox, QComboBox) # <-- Add QComboBox
+                             QDoubleSpinBox, QSpinBox, QComboBox)
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 
@@ -33,6 +32,7 @@ class HomingWorker(QThread):
 class HotWireController(QMainWindow):
     # Hardware calibration only. No digital scaling required for DXFs.
     STEPS_PER_MM = 1309.6  
+    MAX_SEGMENT_MM = 1.0
 
     def __init__(self):
         super().__init__()
@@ -172,20 +172,14 @@ class HotWireController(QMainWindow):
             return
             
         # 2. Extract raw points (You likely missed these two lines)
-        points_a = self.get_dxf_points(self.dxf_a)
-        points_b = self.get_dxf_points(self.dxf_b)
-        
+        points_a, points_b = self.get_job_toolpaths()
+
         # 3. Bail out if the extraction failed or returned empty
-        if not points_a or not points_b: 
+        if not points_a or not points_b:
             return
-            
-        # 4. Process origin shifts and rotation
-        angle = int(self.rot_combo.currentText())
-        points_a = self.process_toolpath(points_a, angle)
-        points_b = self.process_toolpath(points_b, angle)
-        
+
         # 5. Calculate and display final estimate
-        smoothed_speeds = self.calculate_dynamic_speeds(points_a)
+        smoothed_speeds = self.calculate_job_speeds(points_a, points_b)
         self.calculate_estimate(points_a, points_b, smoothed_speeds)
 
     def calculate_dynamic_speeds(self, points):
@@ -219,6 +213,10 @@ class HotWireController(QMainWindow):
             smoothed_speeds.append(min(raw_speeds[i], prev_s, next_s))
             
         return smoothed_speeds
+
+    def calculate_job_speeds(self, points_a, points_b):
+        return [min(a, b) for a, b in zip(self.calculate_dynamic_speeds(points_a),
+                                          self.calculate_dynamic_speeds(points_b))]
 
     def poll_status(self):
         if self.serial_conn and self.serial_conn.is_open:
@@ -310,7 +308,27 @@ class HotWireController(QMainWindow):
 
     def get_job_toolpaths(self):
         angle = int(self.rot_combo.currentText())
-        return [self.process_toolpath(self.get_dxf_points(f), angle) for f in (self.dxf_a, self.dxf_b)]
+        paths = [self.process_toolpath(self.get_dxf_points(f), angle) for f in (self.dxf_a, self.dxf_b)]
+        return self.synchronize_toolpaths(*paths) if all(paths) else paths
+
+    def synchronize_toolpaths(self, *paths):
+        contours, fractions, lengths = [], [], []
+        orientation = None
+        for path in paths:
+            points = np.asarray(path[1:], dtype=float)
+            if np.allclose(points[0], points[-1]):
+                direction = np.sign(np.sum(points[:-1, 0] * points[1:, 1] - points[1:, 0] * points[:-1, 1]))
+                if orientation is None: orientation = direction
+                elif direction and orientation and direction != orientation: points = points[::-1]
+            distance = np.r_[0.0, np.cumsum(np.hypot(*np.diff(points, axis=0).T))]
+            keep = np.r_[True, np.diff(distance) > 1e-9]
+            points, distance = points[keep], distance[keep]
+            if len(points) < 2 or distance[-1] == 0: return list(paths)
+            contours.append(points); lengths.append(distance[-1]); fractions.append(distance / distance[-1])
+        samples = np.unique(np.concatenate((*fractions, np.linspace(0, 1, int(np.ceil(max(lengths) / self.MAX_SEGMENT_MM)) + 1))))
+        return [[path[0]] + list(zip(np.interp(samples, fraction, points[:, 0]),
+                                     np.interp(samples, fraction, points[:, 1])))
+                for path, points, fraction in zip(paths, contours, fractions)]
 
     def get_machine_moves(self, points_a, points_b):
         origins = [int(box.value() * self.STEPS_PER_MM) for box in
@@ -441,7 +459,7 @@ class HotWireController(QMainWindow):
             
         self.set_status("Calculating Toolpath Dynamics...")
 
-        smoothed_speeds = self.calculate_dynamic_speeds(points_a)
+        smoothed_speeds = self.calculate_job_speeds(points_a, points_b)
         self.calculate_estimate(points_a, points_b, smoothed_speeds)
         
         self.serial_conn.write(f"UPLOAD,{len(points_a)}\n".encode())

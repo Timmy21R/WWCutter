@@ -26,8 +26,11 @@ is available for the selected Python version.
 2. If necessary, select different root and tip sections from their dropdowns.
    Open-shell boundary loops are also available in the two section lists.
 3. Enter the tower spacing, distance from the left tower to the root face, and
-   horizontal/vertical travel. Choose whether internal contours are ignored or
-   cut through an entry slit.
+   horizontal/vertical travel. Set the stock rotation about its span axis and
+   its root-section center in the machine workspace. Stock-position controls
+   are constrained to the range where both complete tower paths remain inside
+   the configured travel and safety margin. Choose whether internal contours
+   are ignored or cut through an entry slit.
 4. Choose **Resulting cut surface** to inspect the complete surface swept by
    the physical wire, or **Complete machine** to see it in the tower workspace.
    Move the slider to inspect every individual wire position. Green and blue

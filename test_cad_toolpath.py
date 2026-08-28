@@ -114,6 +114,49 @@ class StepToolpathTests(unittest.TestCase):
                 MachineGeometry(700, 120, 40, 40, 5),
             )
 
+    def test_requested_stock_rotation_is_applied_exactly(self):
+        model = load_step_model(self.step_path)
+        root, tip = auto_detect_section_pair(model)
+        path = build_cad_toolpath(
+            model, root.index, tip.index,
+            MachineGeometry(700, 120, 700, 500, 10),
+            rotation_degrees=27.5,
+        )
+
+        self.assertAlmostEqual(path.stock_rotation, 27.5)
+
+    def test_stock_position_is_limited_by_both_tower_paths(self):
+        model = load_step_model(self.step_path)
+        root, tip = auto_detect_section_pair(model)
+        machine = MachineGeometry(700, 120, 700, 500, 10)
+        path = build_cad_toolpath(
+            model, root.index, tip.index, machine,
+            rotation_degrees=18.0,
+            stock_position=(-10000.0, 10000.0),
+            clamp_stock_position=True,
+        )
+
+        np.testing.assert_allclose(
+            path.stock_position,
+            [path.stock_position_min[0], path.stock_position_max[1]],
+        )
+        combined = np.vstack((path.tower_left, path.tower_right))
+        self.assertGreaterEqual(combined[:, 0].min(), machine.margin - 1e-9)
+        self.assertLessEqual(
+            combined[:, 0].max(), machine.horizontal_travel - machine.margin + 1e-9
+        )
+        self.assertGreaterEqual(combined[:, 1].min(), machine.margin - 1e-9)
+        self.assertLessEqual(
+            combined[:, 1].max(), machine.vertical_travel - machine.margin + 1e-9
+        )
+
+        with self.assertRaisesRegex(CADGeometryError, "tower-path-safe range"):
+            build_cad_toolpath(
+                model, root.index, tip.index, machine,
+                rotation_degrees=18.0,
+                stock_position=(-10000.0, 10000.0),
+            )
+
 
 @unittest.skipUnless(
     (Path(__file__).parent / "MasterSections.step").exists(),
@@ -143,6 +186,16 @@ class IncludedStepRegressionTests(unittest.TestCase):
         self.assertEqual(included.interior_count, 1)
         self.assertFalse(included.limitations)
         self.assertGreater(len(included.root_xy), len(ignored.root_xy))
+
+        left_segments = np.linalg.norm(
+            np.diff(included.tower_left, axis=0), axis=1
+        )
+        right_segments = np.linalg.norm(
+            np.diff(included.tower_right, axis=0), axis=1
+        )
+        self.assertLessEqual(
+            max(left_segments.max(), right_segments.max()), 1.0 + 1e-9
+        )
 
     @unittest.skipUnless(
         (Path(__file__).parent / "MasterSections12.step").exists(),

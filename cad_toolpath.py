@@ -82,6 +82,9 @@ class CADToolpath:
     horizontal: np.ndarray
     vertical: np.ndarray
     stock_rotation: float
+    stock_position: np.ndarray
+    stock_position_min: np.ndarray
+    stock_position_max: np.ndarray
     surface_error: float
     deviation_detail: str
     limitations: tuple
@@ -789,8 +792,8 @@ def _boundary_bow_error(model, root, tip, origin, axis, span):
 
 
 def _choose_workspace_axes(root_points, tip_points, origin, axis, horizontal,
-                           vertical, machine):
-    """Rotate the stock about its span axis when that uses the workspace better."""
+                           vertical, machine, rotation_degrees=None):
+    """Apply a requested span-axis rotation or auto-fit one when unspecified."""
     root_relative = root_points - origin
     tip_relative = tip_points - origin
     root_depth = machine.foam_left_gap + root_relative @ axis
@@ -826,6 +829,11 @@ def _choose_workspace_axes(root_points, tip_points, origin, axis, horizontal,
         ])
         utilization = float(np.max(extents / np.maximum(available, 1e-9)))
         return utilization, rotated_horizontal, rotated_vertical
+
+    if rotation_degrees is not None:
+        _, rotated_horizontal, rotated_vertical = evaluate(rotation_degrees)
+        return (rotated_horizontal, rotated_vertical,
+                float(rotation_degrees))
 
     initial = evaluate(0.0)
     if initial[0] <= 1.0:
@@ -919,8 +927,35 @@ def _sample_inner_pair(root_wire, tip_wire, root, tip, horizontal, vertical,
             np.vstack((tip_points, tip_points[0])))
 
 
+def _subdivide_projected_path(root_points, tip_points, root_local, tip_local,
+                              tower_left, tower_right, max_segment):
+    """Insert synchronized positions until every tower move is short enough."""
+    arrays = tuple(np.asarray(array, dtype=float) for array in (
+        root_points, tip_points, root_local, tip_local, tower_left, tower_right,
+    ))
+    if not arrays or len(arrays[0]) < 2:
+        return arrays
+
+    maximum = max(float(max_segment), 1e-6)
+    results = [[array[0]] for array in arrays]
+    for index in range(1, len(arrays[0])):
+        distance = max(
+            np.linalg.norm(arrays[4][index] - arrays[4][index - 1]),
+            np.linalg.norm(arrays[5][index] - arrays[5][index - 1]),
+        )
+        segment_count = max(1, int(np.ceil(distance / maximum)))
+        for step in range(1, segment_count + 1):
+            fraction = step / segment_count
+            for result, array in zip(results, arrays):
+                result.append(
+                    array[index - 1]
+                    + fraction * (array[index] - array[index - 1])
+                )
+    return tuple(np.asarray(result) for result in results)
+
+
 def project_rulings(root_points, tip_points, origin, axis, horizontal, vertical,
-                    machine):
+                    machine, stock_position=None, clamp_stock_position=False):
     root_relative = root_points - origin
     tip_relative = tip_points - origin
     root_local = np.column_stack((
@@ -954,18 +989,45 @@ def project_rulings(root_points, tip_points, origin, axis, horizontal, vertical,
                 width, height, available_x, available_y
             )
         )
-    x_shift = machine.horizontal_travel * 0.5 - 0.5 * (combined_x.min() + combined_x.max())
-    y_shift = machine.vertical_travel * 0.5 - 0.5 * (combined_y.min() + combined_y.max())
-    shift = np.array([x_shift, y_shift])
+    position_min = np.array([
+        machine.margin - combined_x.min(),
+        machine.margin - combined_y.min(),
+    ])
+    position_max = np.array([
+        machine.horizontal_travel - machine.margin - combined_x.max(),
+        machine.vertical_travel - machine.margin - combined_y.max(),
+    ])
+    if stock_position is None:
+        shift = 0.5 * (position_min + position_max)
+    else:
+        requested = np.asarray(stock_position, dtype=float)
+        if requested.shape != (2,):
+            raise CADGeometryError("Stock position must contain X and Y coordinates.")
+        if clamp_stock_position:
+            shift = np.clip(requested, position_min, position_max)
+        elif np.any(requested < position_min - 1e-9) or np.any(
+                requested > position_max + 1e-9):
+            raise CADGeometryError(
+                "Stock center is outside the tower-path-safe range. X must be "
+                "{:.1f} to {:.1f} mm and Y must be {:.1f} to {:.1f} mm.".format(
+                    position_min[0], position_max[0],
+                    position_min[1], position_max[1],
+                )
+            )
+        else:
+            shift = requested
     tower_left += shift
     tower_right += shift
     root_local[:, :2] += shift
     tip_local[:, :2] += shift
-    return root_local, tip_local, tower_left, tower_right, shift
+    return (root_local, tip_local, tower_left, tower_right, shift,
+            position_min, position_max)
 
 
 def build_cad_toolpath(model, root_index, tip_index, machine,
-                       max_segment=1.0, include_internal=False):
+                       max_segment=1.0, include_internal=False,
+                       rotation_degrees=None, stock_position=None,
+                       clamp_stock_position=False):
     if root_index == tip_index:
         raise CADGeometryError("Choose two different end sections.")
     root = model.sections[root_index]
@@ -991,7 +1053,7 @@ def build_cad_toolpath(model, root_index, tip_index, machine,
     )
     horizontal, vertical, stock_rotation = _choose_workspace_axes(
         outer_root_points, outer_tip_points, origin, axis,
-        horizontal, vertical, machine
+        horizontal, vertical, machine, rotation_degrees
     )
     ruling_error = _surface_error(
         model, root, tip, outer_root_points, outer_tip_points
@@ -1046,8 +1108,15 @@ def build_cad_toolpath(model, root_index, tip_index, machine,
         tip_parts.extend((inner_tip, outer_tip_points[:1]))
     root_points = np.vstack(root_parts)
     tip_points = np.vstack(tip_parts)
-    root_local, tip_local, tower_left, tower_right, shift = project_rulings(
-        root_points, tip_points, origin, axis, horizontal, vertical, machine
+    (root_local, tip_local, tower_left, tower_right, shift,
+     position_min, position_max) = project_rulings(
+        root_points, tip_points, origin, axis, horizontal, vertical, machine,
+        stock_position, clamp_stock_position,
+    )
+    (root_points, tip_points, root_local, tip_local,
+     tower_left, tower_right) = _subdivide_projected_path(
+        root_points, tip_points, root_local, tip_local,
+        tower_left, tower_right, max_segment,
     )
 
     model_vertices = []
@@ -1096,6 +1165,7 @@ def build_cad_toolpath(model, root_index, tip_index, machine,
         root_local[:, :2], tip_local[:, :2], root_local, tip_local,
         tower_left, tower_right,
         model_vertices, origin, axis, horizontal, vertical, stock_rotation,
+        shift, position_min, position_max,
         surface_error, deviation_detail, tuple(limitations), len(interior_paths),
         ignored_interior_count,
         float(wire_lengths.min()), float(wire_lengths.max()),

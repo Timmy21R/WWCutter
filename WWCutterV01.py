@@ -153,7 +153,31 @@ class HotWireController(QMainWindow):
         self.interior_features.currentIndexChanged.connect(
             self.schedule_cad_rebuild
         )
-        machine_layout.addWidget(self.interior_features, 2, 1, 1, 2)
+        machine_layout.addWidget(self.interior_features, 2, 1)
+
+        machine_layout.addWidget(QLabel("Stock rotation"), 2, 2)
+        self.stock_rotation = geometry_box(0.0, -180.0, 180.0)
+        self.stock_rotation.setSuffix("°")
+        self.stock_rotation.setWrapping(True)
+        self.stock_rotation.setToolTip(
+            "Rotate the STEP model about its root-to-tip span axis."
+        )
+        machine_layout.addWidget(self.stock_rotation, 2, 3)
+
+        machine_layout.addWidget(QLabel("Stock center X"), 3, 0)
+        self.stock_position_x = geometry_box(500.0, -10000.0, 10000.0)
+        self.stock_position_x.setSuffix(" mm")
+        machine_layout.addWidget(self.stock_position_x, 3, 1)
+        machine_layout.addWidget(QLabel("Stock center Y"), 3, 2)
+        self.stock_position_y = geometry_box(500.0, -10000.0, 10000.0)
+        self.stock_position_y.setSuffix(" mm")
+        machine_layout.addWidget(self.stock_position_y, 3, 3)
+        stock_position_tip = (
+            "Position of the root-section center in the XY/UV workspace. The "
+            "allowed range is constrained by both complete tower paths."
+        )
+        self.stock_position_x.setToolTip(stock_position_tip)
+        self.stock_position_y.setToolTip(stock_position_tip)
         layout.addWidget(machine_group)
 
         preview_header = QHBoxLayout()
@@ -325,6 +349,10 @@ class HotWireController(QMainWindow):
                 self.step_model, root.index, tip.index,
                 self.machine_geometry(), self.MAX_SEGMENT_MM,
                 include_internal=bool(self.interior_features.currentData()),
+                rotation_degrees=self.stock_rotation.value(),
+                stock_position=(self.stock_position_x.value(),
+                                self.stock_position_y.value()),
+                clamp_stock_position=True,
             )
         except CADGeometryError as exc:
             self.cad_path = None
@@ -334,6 +362,7 @@ class HotWireController(QMainWindow):
             self.set_status("Geometry error: {}".format(exc))
             return
 
+        self._update_stock_position_controls()
         self.preview_move.setEnabled(True)
         self.preview_move.setMaximum(max(0, len(self.cad_path.tower_left) - 1))
         self.cad_preview.set_scene(
@@ -342,6 +371,25 @@ class HotWireController(QMainWindow):
         self.on_preview_move(self.preview_move.value())
         self.update_cad_validation()
         self.update_time_estimate()
+
+    def _update_stock_position_controls(self):
+        minimum = self.cad_path.stock_position_min
+        maximum = self.cad_path.stock_position_max
+        actual = self.cad_path.stock_position
+        for axis_name, box, low, high, value in zip(
+                ("X", "Y"),
+                (self.stock_position_x, self.stock_position_y),
+                minimum, maximum, actual):
+            box.blockSignals(True)
+            box.setRange(float(low), float(high))
+            box.setValue(float(value))
+            box.setToolTip(
+                "Allowed {} stock-center range for the current orientation and "
+                "tower paths: {:.1f} to {:.1f} mm.".format(
+                    axis_name, low, high
+                )
+            )
+            box.blockSignals(False)
 
     def on_preview_move(self, value):
         if self.step_model is not None and self.cad_path is not None:

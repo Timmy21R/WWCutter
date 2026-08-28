@@ -3,15 +3,13 @@
 import time
 import numpy as np
 
-from PyQt6.QtCore import QPointF, Qt, pyqtSignal
+from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtGui import (QColor, QPainter, QPainterPath, QPen, QPixmap,
                          QPolygonF)
 from PyQt6.QtWidgets import QWidget
 
 
 class CADPreview(QWidget):
-    faceClicked = pyqtSignal(int)
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(720, 430)
@@ -26,10 +24,8 @@ class CADPreview(QWidget):
         self.yaw = np.radians(-28.0)
         self.pitch = np.radians(18.0)
         self.zoom = 1.0
-        self._press_position = None
         self._last_position = None
         self._dragged = False
-        self._pick_faces = []
         self._static_cache = None
         self._cached_project = None
         self._last_drag_paint = 0.0
@@ -37,7 +33,6 @@ class CADPreview(QWidget):
     def _invalidate_static(self):
         self._static_cache = None
         self._cached_project = None
-        self._pick_faces = []
 
     def clear(self):
         self.model = None
@@ -138,7 +133,6 @@ class CADPreview(QWidget):
         cache.fill(QColor(23, 26, 31))
         painter = QPainter(cache)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, not self._dragged)
-        self._pick_faces = []
         if self.model is None:
             painter.setPen(QColor(165, 172, 182))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
@@ -182,7 +176,7 @@ class CADPreview(QWidget):
             faces.append((float(np.mean(depth)), mesh.face_index, face_path))
 
         # Face-level depth sorting and batching avoids thousands of individual
-        # draw calls while remaining plenty clear for section selection.
+        # draw calls while keeping the selected sections visually distinct.
         faces.sort(key=lambda item: item[0])
         for depth, face_index, face_path in faces:
             if face_index == self.root_face:
@@ -198,13 +192,12 @@ class CADPreview(QWidget):
             painter.setBrush(fill)
             painter.setPen(QPen(edge, 0.55))
             painter.drawPath(face_path)
-            self._pick_faces.append((face_index, face_path))
 
         if self.toolpath is not None and self.machine is not None:
             self._draw_machine_static(painter, project)
 
         painter.setPen(QColor(210, 215, 224))
-        painter.drawText(14, 22, "Drag to rotate  •  wheel to zoom  •  click a planar face to select")
+        painter.drawText(14, 22, "Drag to rotate  •  wheel to zoom")
         painter.end()
         self._static_cache = cache
         self._cached_project = project
@@ -347,7 +340,6 @@ class CADPreview(QWidget):
             painter.drawEllipse(QPointF(*point), 4.5, 4.5)
 
     def mousePressEvent(self, event):
-        self._press_position = event.position()
         self._last_position = event.position()
         self._dragged = False
 
@@ -369,16 +361,10 @@ class CADPreview(QWidget):
     def mouseReleaseEvent(self, event):
         was_dragged = self._dragged
         self._dragged = False
-        if not was_dragged:
-            for face_index, face_path in reversed(self._pick_faces):
-                if face_path.contains(event.position()):
-                    self.faceClicked.emit(face_index)
-                    break
-        else:
+        if was_dragged:
             # Replace the low-cost drag frame with an antialiased final frame.
             self._invalidate_static()
             self.update()
-        self._press_position = None
         self._last_position = None
 
     def wheelEvent(self, event):

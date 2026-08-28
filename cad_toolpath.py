@@ -12,7 +12,7 @@ import numpy as np
 
 try:
     import cadquery as cq
-except ImportError:  # The DXF-only application can still start without CAD.
+except ImportError:  # Defer the dependency error until STEP import is requested.
     cq = None
 
 

@@ -1,5 +1,4 @@
 cadquery>=2.5,<2.7
-ezdxf>=1.3
 numpy>=1.26
 PyQt6>=6.6
 pyserial>=3.5

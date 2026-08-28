@@ -3,12 +3,10 @@ import time
 from pathlib import Path
 import numpy as np
 import serial.tools.list_ports
-import ezdxf
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, 
                              QWidget, QSlider, QLabel, QFileDialog, QHBoxLayout, 
                              QDoubleSpinBox, QSpinBox, QComboBox, QGridLayout,
-                             QGroupBox, QStackedWidget)
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor
+                             QGroupBox, QScrollArea)
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 
 from cad_preview import CADPreview
@@ -37,7 +35,7 @@ class HomingWorker(QThread):
         self.is_running = False
 
 class HotWireController(QMainWindow):
-    # Hardware calibration only. No digital scaling required for DXFs.
+    # Hardware calibration from machine coordinates to motor steps.
     STEPS_PER_MM = 1309.6  
     MAX_SEGMENT_MM = 1.0
 
@@ -45,12 +43,9 @@ class HotWireController(QMainWindow):
         super().__init__()
         self.setWindowTitle("WWCutter — Four-Axis Hot-Wire CAM")
         self.serial_conn = None
-        self.dxf_a = None
-        self.dxf_b = None
         self.step_model = None
         self.cad_path = None
         self.cad_valid = False
-        self.pick_target = "root"
         self.cad_rebuild_timer = QTimer(self)
         self.cad_rebuild_timer.setSingleShot(True)
         self.cad_rebuild_timer.setInterval(140)
@@ -82,6 +77,24 @@ class HotWireController(QMainWindow):
         motion.addWidget(QPushButton("Set Current as Origin", clicked=self.set_current_as_origin))
         layout.addLayout(motion)
 
+        manual_group = QGroupBox("Manual axes / job origin (mm)")
+        manual_layout = QHBoxLayout(manual_group)
+        for axis_name in ("X", "Y", "U", "V"):
+            manual_layout.addWidget(QLabel(
+                "Job Origin X (mm):" if axis_name == "X" else "{}:".format(axis_name)
+            ))
+            box = QDoubleSpinBox()
+            box.setRange(-2000.0, 2000.0)
+            box.setDecimals(2)
+            box.setSuffix(" mm")
+            setattr(self, "origin_{}".format(axis_name.lower()), box)
+            manual_layout.addWidget(box)
+        manual_group.setToolTip(
+            "Enter absolute X/Y/U/V machine coordinates, then choose Go to "
+            "Origin. These values do not offset the validated STEP toolpath."
+        )
+        layout.addWidget(manual_group)
+
         cad_group = QGroupBox("STEP model")
         cad_layout = QGridLayout(cad_group)
         cad_layout.addWidget(QPushButton("Import STEP…", clicked=self.load_step), 0, 0)
@@ -89,19 +102,12 @@ class HotWireController(QMainWindow):
         self.step_name = QLabel("No STEP model loaded")
         cad_layout.addWidget(self.step_name, 0, 2, 1, 3)
 
-        self.pick_root = QPushButton("Pick Root")
-        self.pick_root.setCheckable(True)
-        self.pick_root.setChecked(True)
-        self.pick_root.clicked.connect(lambda: self.set_pick_target("root"))
-        cad_layout.addWidget(self.pick_root, 1, 0)
+        cad_layout.addWidget(QLabel("Root section:"), 1, 0)
         self.root_section = QComboBox()
         self.root_section.currentIndexChanged.connect(self.rebuild_cad_toolpath)
         cad_layout.addWidget(self.root_section, 1, 1, 1, 4)
 
-        self.pick_tip = QPushButton("Pick Tip")
-        self.pick_tip.setCheckable(True)
-        self.pick_tip.clicked.connect(lambda: self.set_pick_target("tip"))
-        cad_layout.addWidget(self.pick_tip, 2, 0)
+        cad_layout.addWidget(QLabel("Tip section:"), 2, 0)
         self.tip_section = QComboBox()
         self.tip_section.currentIndexChanged.connect(self.rebuild_cad_toolpath)
         cad_layout.addWidget(self.tip_section, 2, 1, 1, 4)
@@ -158,24 +164,14 @@ class HotWireController(QMainWindow):
         self.preview_focus = QComboBox()
         self.preview_focus.addItem("Complete machine", "machine")
         self.preview_focus.addItem("Resulting cut surface", "cut")
-        self.preview_focus.addItem("Imported model / face picking", "model")
+        self.preview_focus.addItem("Imported model", "model")
         self.preview_focus.currentIndexChanged.connect(
             lambda: self.cad_preview.set_focus(self.preview_focus.currentData())
         )
         preview_header.addWidget(self.preview_focus)
         layout.addLayout(preview_header)
-        self.preview_stack = QStackedWidget()
         self.cad_preview = CADPreview()
-        self.cad_preview.faceClicked.connect(self.select_preview_face)
-        self.preview_stack.addWidget(self.cad_preview)
-
-        self.preview_label = QLabel("Import a STEP model or load two DXF profiles")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumHeight(300)
-        self.preview_label.setStyleSheet("background-color: #1e1e1e; color: #aaa; border: 1px solid #444;")
-        self.preview_stack.addWidget(self.preview_label)
-        self.preview_stack.setCurrentWidget(self.cad_preview)
-        layout.addWidget(self.preview_stack, 1)
+        layout.addWidget(self.cad_preview, 1)
 
         self.preview_move = QSlider(Qt.Orientation.Horizontal)
         self.preview_move.valueChanged.connect(self.on_preview_move)
@@ -199,42 +195,13 @@ class HotWireController(QMainWindow):
         speed_layout.addWidget(self.speed_slider, 1)
         speed_layout.addWidget(self.speed_box)
         layout.addLayout(speed_layout)
-
-        legacy_group = QGroupBox("Legacy two-DXF input")
-        legacy_layout = QVBoxLayout(legacy_group)
-        legacy_buttons = QHBoxLayout()
-        legacy_buttons.addWidget(QPushButton("Import DXF Side A", clicked=lambda: self.load_dxf("A")))
-        legacy_buttons.addWidget(QPushButton("Import DXF Side B", clicked=lambda: self.load_dxf("B")))
-        legacy_layout.addLayout(legacy_buttons)
-        origin_layout = QHBoxLayout()
-        origin_layout.addWidget(QLabel("Tower offsets X:"))
-        self.origin_x = QDoubleSpinBox(); self.origin_x.setRange(-2000, 2000)
-        origin_layout.addWidget(self.origin_x)
-        origin_layout.addWidget(QLabel("Y:"))
-        self.origin_y = QDoubleSpinBox(); self.origin_y.setRange(-2000, 2000)
-        origin_layout.addWidget(self.origin_y)
-        origin_layout.addWidget(QLabel("U:"))
-        self.origin_u = QDoubleSpinBox(); self.origin_u.setRange(-2000, 2000)
-        origin_layout.addWidget(self.origin_u)
-        origin_layout.addWidget(QLabel("V:"))
-        self.origin_v = QDoubleSpinBox(); self.origin_v.setRange(-2000, 2000)
-        origin_layout.addWidget(self.origin_v)
-        for box in (self.origin_x, self.origin_y, self.origin_u, self.origin_v):
-            box.valueChanged.connect(self.update_preview)
-        legacy_layout.addLayout(origin_layout)
-        rot_layout = QHBoxLayout()
-        rot_layout.addWidget(QLabel("DXF Rotation (Degrees):"))
-        self.rot_combo = QComboBox()
-        self.rot_combo.addItems(["0", "90", "180", "270"])
-        self.rot_combo.currentTextChanged.connect(self.update_preview)
-        self.rot_combo.currentTextChanged.connect(self.update_time_estimate)
-        rot_layout.addWidget(self.rot_combo)
-        legacy_layout.addLayout(rot_layout)
-        layout.addWidget(legacy_group)
         
         container = QWidget()
         container.setLayout(layout)
-        self.setCentralWidget(container)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(container)
+        self.setCentralWidget(scroll_area)
         self.resize(1040, 920)
 
     def set_status(self, text):
@@ -272,7 +239,6 @@ class HotWireController(QMainWindow):
             for section in self.step_model.sections:
                 combo.addItem(section.label, section.index)
             combo.blockSignals(False)
-        self.preview_stack.setCurrentWidget(self.cad_preview)
         self.select_auto_sections()
 
     def select_auto_sections(self):
@@ -291,24 +257,6 @@ class HotWireController(QMainWindow):
         self.root_section.blockSignals(False)
         self.tip_section.blockSignals(False)
         self.rebuild_cad_toolpath()
-
-    def set_pick_target(self, target):
-        self.pick_target = target
-        self.pick_root.setChecked(target == "root")
-        self.pick_tip.setChecked(target == "tip")
-
-    def select_preview_face(self, face_index):
-        if self.step_model is None:
-            return
-        matches = [section for section in self.step_model.sections
-                   if section.face_index == face_index]
-        if not matches:
-            self.set_status("That face is not a planar end-section candidate.")
-            return
-        combo = self.root_section if self.pick_target == "root" else self.tip_section
-        combo.setCurrentIndex(combo.findData(matches[0].index))
-        if self.pick_target == "root":
-            self.set_pick_target("tip")
 
     def _selected_sections(self):
         if self.step_model is None:
@@ -406,15 +354,10 @@ class HotWireController(QMainWindow):
                     index + 1, len(self.cad_path.tower_left), x, y, u, v
                 )
             )
-        elif self.dxf_a and self.dxf_b:
-            self.update_preview()
 
-    def calculate_estimate(self, points_a, points_b, speeds, moves=None):
+    def calculate_estimate(self, speeds, moves):
         total_time = 0.0
-        min_len = min(len(points_a), len(points_b))
-        if moves is None:
-            moves = self.get_machine_moves(points_a, points_b)
-        for i in range(1, min_len):
+        for i in range(1, len(moves)):
             # MultiStepper times a segment from the largest individual axis
             # displacement, not the Euclidean length of either 2-D endpoint.
             step_distance = max(abs(moves[i][axis] - moves[i - 1][axis])
@@ -436,19 +379,13 @@ class HotWireController(QMainWindow):
         self.time_label.setText(f"Est. Job Time: {time_str}")
      
     def update_time_estimate(self):
-        if self.step_model is not None:
-            if self.cad_path is None:
-                return
-        elif not (self.dxf_a and self.dxf_b):
+        if self.cad_path is None:
             return
         points_a, points_b = self.get_job_toolpaths()
         if not points_a or not points_b:
             return
         smoothed_speeds = self.calculate_job_speeds(points_a, points_b)
-        self.calculate_estimate(
-            points_a, points_b, smoothed_speeds,
-            self.get_machine_moves(points_a, points_b),
-        )
+        self.calculate_estimate(smoothed_speeds, self.get_machine_moves())
 
     def calculate_dynamic_speeds(self, points):
         base_speed = self.speed_box.value()
@@ -506,238 +443,40 @@ class HotWireController(QMainWindow):
                 return
         self.set_status("Connection Failed")
 
-    def load_dxf(self, side):
-        path, _ = QFileDialog.getOpenFileName(self, f"Select DXF for {side}", filter="DXF Files (*.dxf)")
-        if path:
-            self.step_model = None
-            self.cad_path = None
-            self.cad_valid = False
-            if side == "A": 
-                self.dxf_a = path
-            else: 
-                self.dxf_b = path
-            self.preview_stack.setCurrentWidget(self.preview_label)
-            self.set_status(f"Loaded DXF {side}")
-            self.update_preview()  
-            self.update_time_estimate()
-    
-    def rotate_points(self, points, angle_deg):
-        if not points: return []
-        angle_rad = np.radians(angle_deg)
-        cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-        rotated = []
-        for x, y in points:
-            nx = x * cos_a - y * sin_a
-            ny = x * sin_a + y * cos_a
-            rotated.append((nx, ny))
-        return rotated
-
-    def update_preview(self):
-        if self.step_model is not None:
-            if self.cad_path is not None:
-                self.cad_preview.set_scene(
-                    self.step_model, self.cad_path.root_section,
-                    self.cad_path.tip_section, self.cad_path,
-                    self.machine_geometry(),
-                )
-                self.on_preview_move(self.preview_move.value())
-            return
-        if not (self.dxf_a and self.dxf_b): return
-        paths = self.get_job_toolpaths()
-        if not all(paths): return
-        moves = self.get_machine_moves(*paths)
-        if not moves: return
-        draw_paths = [[(m[a] / self.STEPS_PER_MM, m[a + 1] / self.STEPS_PER_MM) for m in moves]
-                      for a in (0, 2)]
-        points = draw_paths[0] + draw_paths[1]
-        move_count = len(moves)
-        self.preview_move.setEnabled(True)
-        self.preview_move.setMaximum(max(0, move_count - 1))
-
-        min_x, max_x = min(p[0] for p in points), max(p[0] for p in points)
-        min_y, max_y = min(p[1] for p in points), max(p[1] for p in points)
-        width, height = max_x - min_x, max_y - min_y
-        if width == 0: width = 1
-        if height == 0: height = 1
-        
-        cw, ch, padding = 600, 250, 20
-        scale = min((cw - padding*2) / width, (ch - padding*2) / height)
-        
-        pixmap = QPixmap(cw, ch)
-        pixmap.fill(QColor(30, 30, 30))
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        screen = lambda p: (padding + (p[0] - min_x) * scale,
-                            ch - padding - (p[1] - min_y) * scale)
-        for toolpath, color in zip(draw_paths, (QColor(0, 255, 100), QColor(0, 160, 255))):
-            painter.setPen(QPen(color, 2))
-            for p1, p2 in zip(toolpath, toolpath[1:]):
-                painter.drawLine(*map(int, (*screen(p1), *screen(p2))))
-            if toolpath:
-                painter.setBrush(color); painter.setPen(Qt.PenStyle.NoPen)
-                x, y = screen(toolpath[min(self.preview_move.value(), len(toolpath) - 1)])
-                painter.drawEllipse(int(x) - 5, int(y) - 5, 10, 10)
-
-        i = self.preview_move.value()
-        if i < move_count:
-            x, y, u, v = (n / self.STEPS_PER_MM for n in moves[i])
-            self.preview_coords.setText(f"Move {i + 1}/{move_count}   X: {x:.2f}   Y: {y:.2f}   U: {u:.2f}   V: {v:.2f} mm")
-        
-        painter.end()
-        self.preview_label.setPixmap(pixmap)
-
     def get_job_toolpaths(self):
-        if self.step_model is not None:
-            if self.cad_path is None:
-                return [], []
-            return ([tuple(point) for point in self.cad_path.root_xy],
-                    [tuple(point) for point in self.cad_path.tip_xy])
-        angle = int(self.rot_combo.currentText())
-        paths = [self.process_toolpath(self.get_dxf_points(f), angle) for f in (self.dxf_a, self.dxf_b)]
-        return self.synchronize_toolpaths(*paths) if all(paths) else paths
+        if self.cad_path is None:
+            return [], []
+        return ([tuple(point) for point in self.cad_path.root_xy],
+                [tuple(point) for point in self.cad_path.tip_xy])
 
-    def synchronize_toolpaths(self, *paths):
-        contours, fractions, lengths = [], [], []
-        orientation = None
-        for path in paths:
-            points = np.asarray(path[1:], dtype=float)
-            if np.allclose(points[0], points[-1]):
-                direction = np.sign(np.sum(points[:-1, 0] * points[1:, 1] - points[1:, 0] * points[:-1, 1]))
-                if orientation is None: orientation = direction
-                elif direction and orientation and direction != orientation: points = points[::-1]
-            distance = np.r_[0.0, np.cumsum(np.hypot(*np.diff(points, axis=0).T))]
-            keep = np.r_[True, np.diff(distance) > 1e-9]
-            points, distance = points[keep], distance[keep]
-            if len(points) < 2 or distance[-1] == 0: return list(paths)
-            contours.append(points); lengths.append(distance[-1]); fractions.append(distance / distance[-1])
-        samples = np.unique(np.concatenate((*fractions, np.linspace(0, 1, int(np.ceil(max(lengths) / self.MAX_SEGMENT_MM)) + 1))))
-        return [[path[0]] + list(zip(np.interp(samples, fraction, points[:, 0]),
-                                     np.interp(samples, fraction, points[:, 1])))
-                for path, points, fraction in zip(paths, contours, fractions)]
-
-    def get_machine_moves(self, points_a, points_b):
-        if self.step_model is not None and self.cad_path is not None:
-            return [
-                tuple(int(value * self.STEPS_PER_MM) for value in (*left, *right))
-                for left, right in zip(self.cad_path.tower_left, self.cad_path.tower_right)
-            ]
-        origins = [int(box.value() * self.STEPS_PER_MM) for box in
-                   (self.origin_x, self.origin_y, self.origin_u, self.origin_v)]
-        mins = [min(p[a] for p in points) for points in (points_a, points_b) for a in (0, 1)]
-        return [tuple(int((p[a] - mins[j]) * self.STEPS_PER_MM) + origins[j]
-                      for j, (p, a) in enumerate(((pa, 0), (pa, 1), (pb, 0), (pb, 1))))
-                for pa, pb in zip(points_a, points_b)]
-        
-    def process_toolpath(self, points, angle):
-        if not points: return []
-        
-        # 1. Rotate
-        points = self.rotate_points(points, angle)
-        
-        # 2. Find bounding box bottom-left (Job Origin)
-        pts = np.array(points)
-        min_x, min_y = np.min(pts[:, 0]), np.min(pts[:, 1])
-        
-        # 3. Shift array so the cut starts at the point closest to the origin
-        is_closed = np.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < 1.0
-        if is_closed:
-            dists = np.hypot(pts[:, 0] - min_x, pts[:, 1] - min_y)
-            best_start_idx = np.argmin(dists)
-            if best_start_idx != 0:
-                pts_no_end = pts[:-1]
-                pts_rolled = np.roll(pts_no_end, -best_start_idx, axis=0)
-                final_pts = np.vstack((pts_rolled, pts_rolled[0])).tolist()
-            else:
-                final_pts = pts.tolist()
-        else:
-            dist_start = np.hypot(pts[0][0] - min_x, pts[0][1] - min_y)
-            dist_end = np.hypot(pts[-1][0] - min_x, pts[-1][1] - min_y)
-            if dist_end < dist_start:
-                final_pts = pts[::-1].tolist()
-            else:
-                final_pts = pts.tolist()
-                
-        # 4. Inject the travel move from origin as the literal first coordinate
-        final_pts.insert(0, [min_x, min_y])
-        return [tuple(x) for x in final_pts]
-    
-    def get_dxf_points(self, dxf_file):
-        try:
-            doc = ezdxf.readfile(dxf_file)
-            msp = doc.modelspace()
-            paths = []
-            
-            # 1. Extract geometry in solid, continuous chunks
-            for e in msp:
-                try:
-                    p = ezdxf.path.make_path(e)
-                    verts = list(p.flattening(distance=0.05))
-                    if len(verts) > 1:
-                        paths.append([(v.x, v.y) for v in verts])
-                except: continue
-                    
-            if not paths: return []
-            
-            # 2. Chain the chunks together by matching their endpoints
-            stitched = paths.pop(0)
-            tolerance = 0.5 
-            
-            while paths:
-                curr_end = stitched[-1]
-                curr_start = stitched[0]
-                paths.sort(key=lambda p: min(np.hypot(p[0][0]-curr_end[0], p[0][1]-curr_end[1]), np.hypot(p[-1][0]-curr_end[0], p[-1][1]-curr_end[1]), np.hypot(p[-1][0]-curr_start[0], p[-1][1]-curr_start[1]), np.hypot(p[0][0]-curr_start[0], p[0][1]-curr_start[1])))
-                found = False
-                
-                for i, p in enumerate(paths):
-                    if np.hypot(p[0][0]-curr_end[0], p[0][1]-curr_end[1]) < tolerance:
-                        stitched.extend(p[1:])
-                        paths.pop(i); found = True; break
-                    elif np.hypot(p[-1][0]-curr_end[0], p[-1][1]-curr_end[1]) < tolerance:
-                        stitched.extend(p[::-1][1:])
-                        paths.pop(i); found = True; break
-                    elif np.hypot(p[-1][0]-curr_start[0], p[-1][1]-curr_start[1]) < tolerance:
-                        stitched = p[:-1] + stitched
-                        paths.pop(i); found = True; break
-                    elif np.hypot(p[0][0]-curr_start[0], p[0][1]-curr_start[1]) < tolerance:
-                        stitched = p[::-1][:-1] + stitched
-                        paths.pop(i); found = True; break
-                        
-                if not found:
-                    # Bridge a hard gap to the nearest remaining endpoint.
-                    i = min(range(len(paths)), key=lambda i: min(np.hypot(paths[i][0][0]-curr_end[0], paths[i][0][1]-curr_end[1]), np.hypot(paths[i][-1][0]-curr_end[0], paths[i][-1][1]-curr_end[1])))
-                    p = paths.pop(i)
-                    stitched.extend(p if np.hypot(p[0][0]-curr_end[0], p[0][1]-curr_end[1]) <= np.hypot(p[-1][0]-curr_end[0], p[-1][1]-curr_end[1]) else p[::-1])
-            
-            # REMOVED old is_closed logic. Just return the array.
-            return [tuple(x) for x in stitched]
-            
-        except Exception as e:
-            print(f"Failed to parse DXF: {e}")
+    def get_machine_moves(self):
+        if self.cad_path is None:
             return []
+        return [
+            tuple(int(value * self.STEPS_PER_MM) for value in (*left, *right))
+            for left, right in zip(
+                self.cad_path.tower_left, self.cad_path.tower_right
+            )
+        ]
 
     def set_current_as_origin(self):
         if not self.serial_conn or not self.serial_conn.is_open: return
         
-        # 1. Force the Arduino to reset its internal absolute coordinates to 0
         self.serial_conn.write(b"SETPOS,0,0,0,0\n")
-        
-        # 2. Zero out the UI offset boxes
-        self.origin_x.setValue(0)
-        self.origin_y.setValue(0)
-        self.origin_u.setValue(0)
-        self.origin_v.setValue(0)
-        
+        for box in (self.origin_x, self.origin_y, self.origin_u, self.origin_v):
+            box.setValue(0.0)
         self.set_status("Origin set to current position")
 
     def go_to_origin(self):
         if not self.serial_conn or not self.serial_conn.is_open: return
         self.set_status("Moving to Origin...")
-        x_steps = int(self.origin_x.value() * self.STEPS_PER_MM)
-        y_steps = int(self.origin_y.value() * self.STEPS_PER_MM)
-        u_steps = int(self.origin_u.value() * self.STEPS_PER_MM)
-        v_steps = int(self.origin_v.value() * self.STEPS_PER_MM)
-        self.serial_conn.write(f"MOVE,{x_steps},{y_steps},{u_steps},{v_steps}\n".encode())
+        target_steps = [
+            int(box.value() * self.STEPS_PER_MM)
+            for box in (self.origin_x, self.origin_y, self.origin_u, self.origin_v)
+        ]
+        self.serial_conn.write(
+            "MOVE,{},{},{},{}\n".format(*target_steps).encode()
+        )
 
     def go_to_cut_start(self):
         if not self.serial_conn or not self.serial_conn.is_open:
@@ -747,30 +486,29 @@ class HotWireController(QMainWindow):
         if not points_a or not points_b:
             self.set_status("Load a valid job before positioning")
             return
-        x, y, u, v = self.get_machine_moves(points_a, points_b)[0]
+        x, y, u, v = self.get_machine_moves()[0]
         self.serial_conn.write(f"MOVE,{x},{y},{u},{v}\n".encode())
         self.set_status("Moving to cut start (keep the wire heater off)")
 
     def start_job(self):
-        has_geometry = ((self.step_model is not None and self.cad_path is not None)
-                        or (self.dxf_a and self.dxf_b))
+        has_geometry = self.step_model is not None and self.cad_path is not None
         if not (has_geometry and self.serial_conn):
             return
-        if self.step_model is not None and not self.cad_valid:
+        if not self.cad_valid:
             self.set_status("Cannot start: STEP deviation or interior selection is invalid")
             return
         
         points_a, points_b = self.get_job_toolpaths()
         
         if not points_a or not points_b:
-            self.set_status("Error: Empty or invalid DXF profile")
+            self.set_status("Error: Empty or invalid STEP toolpath")
             return
             
         self.set_status("Calculating Toolpath Dynamics...")
 
         smoothed_speeds = self.calculate_job_speeds(points_a, points_b)
-        moves = self.get_machine_moves(points_a, points_b)
-        self.calculate_estimate(points_a, points_b, smoothed_speeds, moves)
+        moves = self.get_machine_moves()
+        self.calculate_estimate(smoothed_speeds, moves)
         
         self.serial_conn.write(f"UPLOAD,{len(points_a)}\n".encode())
         self.set_status("Uploading...")

@@ -23,9 +23,8 @@ is available for the selected Python version.
 
 1. Select **Import STEP**. Ordinary two-section lofts are detected
    automatically.
-2. If necessary, choose **Pick Root** or **Pick Tip** and click a highlighted
-   planar face in the preview. Open-shell boundary loops are also available in
-   the two section lists.
+2. If necessary, select different root and tip sections from their dropdowns.
+   Open-shell boundary loops are also available in the two section lists.
 3. Enter the tower spacing, distance from the left tower to the root face, and
    horizontal/vertical travel. Choose whether internal contours are ignored or
    cut through an entry slit.
@@ -41,12 +40,14 @@ is available for the selected Python version.
    greater than the configured tolerance and all projected moves fit the
    workspace.
 
+The **Manual axes / job origin** fields provide the four X, Y, U, and V target
+coordinates used by **Go to Origin**. **Set Current as Origin** resets the
+controller's current four-axis position and all four fields to zero. These
+manual values do not offset or bypass validation of the generated STEP path.
+
 Deviation is checked in both directions at intermediate span sections. This
 catches STEP skins that bow between otherwise valid root and tip profiles—a
 straight hot wire can create only a ruled surface. Ignored internal contours
 do not contribute motion or deviation, and the preview labels the measurement
 as outer-only. Through contours can be cut with an entry slit; blind contours
 that do not reach both foam end faces remain blocked.
-
-The older paired-DXF workflow remains available in the **Legacy two-DXF
-input** section.

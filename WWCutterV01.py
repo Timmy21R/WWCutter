@@ -33,6 +33,7 @@ class HotWireController(QMainWindow):
     # Hardware calibration only. No digital scaling required for DXFs.
     STEPS_PER_MM = 1309.6  
     MAX_SEGMENT_MM = 1.0
+    DXF_JOIN_TOLERANCE_MM = 0.5
 
     def __init__(self):
         super().__init__()
@@ -349,7 +350,7 @@ class HotWireController(QMainWindow):
         min_x, min_y = np.min(pts[:, 0]), np.min(pts[:, 1])
         
         # 3. Shift array so the cut starts at the point closest to the origin
-        is_closed = np.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < 1.0
+        is_closed = np.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < 1e-6
         if is_closed:
             dists = np.hypot(pts[:, 0] - min_x, pts[:, 1] - min_y)
             best_start_idx = np.argmin(dists)
@@ -367,10 +368,211 @@ class HotWireController(QMainWindow):
             else:
                 final_pts = pts.tolist()
                 
-        # 4. Inject the travel move from origin as the literal first coordinate
-        final_pts.insert(0, [min_x, min_y])
+        # The first item is the positioning target kept separate by
+        # synchronize_toolpaths().  Duplicating the real cut start makes that
+        # positioning segment zero-length instead of inventing a diagonal from
+        # the bounding-box corner to the DXF geometry.
+        final_pts.insert(0, list(final_pts[0]))
         return [tuple(x) for x in final_pts]
-    
+
+    @staticmethod
+    def _point_segment_projection(point, start, end):
+        px, py = point
+        ax, ay = start
+        bx, by = end
+        dx, dy = bx - ax, by - ay
+        length_squared = dx * dx + dy * dy
+        if length_squared <= 1e-18:
+            return (ax, ay), 0.0, np.hypot(px - ax, py - ay)
+        fraction = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length_squared))
+        projected = (ax + fraction * dx, ay + fraction * dy)
+        return projected, fraction, np.hypot(px - projected[0], py - projected[1])
+
+    def _join_dxf_paths(self, paths, tolerance):
+        """Snap entity endpoints to connected geometry and insert junctions."""
+        paths = [[tuple(map(float, point)) for point in path] for path in paths]
+        endpoint_refs = []
+        for path_index, path in enumerate(paths):
+            if np.hypot(path[0][0] - path[-1][0], path[0][1] - path[-1][1]) <= 1e-7:
+                path[-1] = path[0]
+                continue
+            endpoint_refs.extend(((path_index, 0), (path_index, len(path) - 1)))
+
+        parents = list(range(len(endpoint_refs)))
+
+        def find(index):
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        def union(left, right):
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parents[right_root] = left_root
+
+        for left in range(len(endpoint_refs)):
+            left_path, left_vertex = endpoint_refs[left]
+            left_point = paths[left_path][left_vertex]
+            for right in range(left + 1, len(endpoint_refs)):
+                right_path, right_vertex = endpoint_refs[right]
+                right_point = paths[right_path][right_vertex]
+                if np.hypot(left_point[0] - right_point[0], left_point[1] - right_point[1]) <= tolerance:
+                    union(left, right)
+
+        endpoint_groups = {}
+        for index, reference in enumerate(endpoint_refs):
+            endpoint_groups.setdefault(find(index), []).append(reference)
+
+        insertions = {index: [] for index in range(len(paths))}
+        for references in endpoint_groups.values():
+            source_paths = {path_index for path_index, _ in references}
+            point = paths[references[0][0]][references[0][1]]
+            best = None
+
+            # Entry-line endpoints often meet the middle of a flattened circle,
+            # spline, or polyline segment. Find that attachment explicitly.
+            for path_index, path in enumerate(paths):
+                if path_index in source_paths:
+                    continue
+                for segment_index, (start, end) in enumerate(zip(path, path[1:])):
+                    projected, fraction, distance = self._point_segment_projection(point, start, end)
+                    if distance <= tolerance and (best is None or distance < best[0]):
+                        best = (distance, path_index, segment_index, fraction, projected)
+
+            if best is not None:
+                _, target_path, segment_index, fraction, junction = best
+                point = junction
+                if 1e-9 < fraction < 1.0 - 1e-9:
+                    insertions[target_path].append((segment_index, fraction, point))
+
+            for path_index, vertex_index in references:
+                paths[path_index][vertex_index] = point
+
+        for path_index, pending in insertions.items():
+            unique = {}
+            for segment_index, fraction, point in pending:
+                key = (segment_index, round(fraction, 12))
+                unique[key] = (segment_index, fraction, point)
+            for segment_index, _, point in sorted(unique.values(), reverse=True):
+                paths[path_index].insert(segment_index + 1, point)
+
+        return paths
+
+    @staticmethod
+    def _dxf_graph_bridges(node_count, edges, adjacency):
+        discovery = [-1] * node_count
+        low = [0] * node_count
+        parent_node = [-1] * node_count
+        parent_edge = [-1] * node_count
+        bridges = set()
+        next_time = 0
+
+        discovery[0] = low[0] = next_time
+        next_time += 1
+        stack = [(0, 0)]
+        while stack:
+            node, next_edge = stack[-1]
+            if next_edge < len(adjacency[node]):
+                edge_index = adjacency[node][next_edge]
+                stack[-1] = (node, next_edge + 1)
+                if edge_index == parent_edge[node]:
+                    continue
+                left, right = edges[edge_index]
+                neighbour = right if left == node else left
+                if discovery[neighbour] < 0:
+                    parent_node[neighbour] = node
+                    parent_edge[neighbour] = edge_index
+                    discovery[neighbour] = low[neighbour] = next_time
+                    next_time += 1
+                    stack.append((neighbour, 0))
+                else:
+                    low[node] = min(low[node], discovery[neighbour])
+                continue
+
+            stack.pop()
+            if parent_node[node] >= 0:
+                parent = parent_node[node]
+                if low[node] > discovery[parent]:
+                    bridges.add(parent_edge[node])
+                low[parent] = min(low[parent], low[node])
+
+        return bridges, discovery
+
+    def _trace_dxf_paths(self, paths):
+        """Return an Euler trail made solely from original DXF segments."""
+        coordinates = []
+        node_by_coordinate = {}
+        edges = []
+
+        def node_for(point):
+            key = (round(point[0], 9), round(point[1], 9))
+            if key not in node_by_coordinate:
+                node_by_coordinate[key] = len(coordinates)
+                coordinates.append(tuple(point))
+            return node_by_coordinate[key]
+
+        for path in paths:
+            for start, end in zip(path, path[1:]):
+                if np.hypot(start[0] - end[0], start[1] - end[1]) <= 1e-9:
+                    continue
+                edges.append((node_for(start), node_for(end)))
+
+        if not edges:
+            return []
+
+        adjacency = [[] for _ in coordinates]
+        for edge_index, (left, right) in enumerate(edges):
+            adjacency[left].append(edge_index)
+            adjacency[right].append(edge_index)
+
+        bridges, discovery = self._dxf_graph_bridges(len(coordinates), edges, adjacency)
+        if any(value < 0 for value in discovery):
+            raise ValueError("DXF contains disconnected geometry without entry lines")
+
+        traversal_edges = list(edges)
+        if bridges and len(bridges) < len(edges):
+            # A closed contour joined to another contour by an entry line has
+            # odd junctions. Retracing graph bridges is the required exit;
+            # unlike the former fallback, it never adds a new cutting line.
+            traversal_edges.extend(edges[index] for index in sorted(bridges))
+
+        traversal_adjacency = [[] for _ in coordinates]
+        for edge_index, (left, right) in enumerate(traversal_edges):
+            traversal_adjacency[left].append(edge_index)
+            traversal_adjacency[right].append(edge_index)
+
+        odd_nodes = [node for node, incident in enumerate(traversal_adjacency) if len(incident) % 2]
+        if len(odd_nodes) not in (0, 2):
+            raise ValueError("DXF geometry cannot be followed as one continuous toolpath")
+
+        min_x = min(point[0] for point in coordinates)
+        min_y = min(point[1] for point in coordinates)
+        candidates = odd_nodes or range(len(coordinates))
+        start_node = min(candidates, key=lambda node: np.hypot(
+            coordinates[node][0] - min_x, coordinates[node][1] - min_y))
+
+        used = [False] * len(traversal_edges)
+        stack = [start_node]
+        circuit = []
+        while stack:
+            node = stack[-1]
+            while traversal_adjacency[node] and used[traversal_adjacency[node][-1]]:
+                traversal_adjacency[node].pop()
+            if not traversal_adjacency[node]:
+                circuit.append(stack.pop())
+                continue
+            edge_index = traversal_adjacency[node].pop()
+            if used[edge_index]:
+                continue
+            used[edge_index] = True
+            left, right = traversal_edges[edge_index]
+            stack.append(right if left == node else left)
+
+        if not all(used):
+            raise ValueError("DXF geometry could not be fully traversed")
+        return [coordinates[node] for node in reversed(circuit)]
+
     def get_dxf_points(self, dxf_file):
         try:
             doc = ezdxf.readfile(dxf_file)
@@ -388,38 +590,8 @@ class HotWireController(QMainWindow):
                     
             if not paths: return []
             
-            # 2. Chain the chunks together by matching their endpoints
-            stitched = paths.pop(0)
-            tolerance = 0.5 
-            
-            while paths:
-                curr_end = stitched[-1]
-                curr_start = stitched[0]
-                paths.sort(key=lambda p: min(np.hypot(p[0][0]-curr_end[0], p[0][1]-curr_end[1]), np.hypot(p[-1][0]-curr_end[0], p[-1][1]-curr_end[1]), np.hypot(p[-1][0]-curr_start[0], p[-1][1]-curr_start[1]), np.hypot(p[0][0]-curr_start[0], p[0][1]-curr_start[1])))
-                found = False
-                
-                for i, p in enumerate(paths):
-                    if np.hypot(p[0][0]-curr_end[0], p[0][1]-curr_end[1]) < tolerance:
-                        stitched.extend(p[1:])
-                        paths.pop(i); found = True; break
-                    elif np.hypot(p[-1][0]-curr_end[0], p[-1][1]-curr_end[1]) < tolerance:
-                        stitched.extend(p[::-1][1:])
-                        paths.pop(i); found = True; break
-                    elif np.hypot(p[-1][0]-curr_start[0], p[-1][1]-curr_start[1]) < tolerance:
-                        stitched = p[:-1] + stitched
-                        paths.pop(i); found = True; break
-                    elif np.hypot(p[0][0]-curr_start[0], p[0][1]-curr_start[1]) < tolerance:
-                        stitched = p[::-1][:-1] + stitched
-                        paths.pop(i); found = True; break
-                        
-                if not found:
-                    # Bridge a hard gap to the nearest remaining endpoint.
-                    i = min(range(len(paths)), key=lambda i: min(np.hypot(paths[i][0][0]-curr_end[0], paths[i][0][1]-curr_end[1]), np.hypot(paths[i][-1][0]-curr_end[0], paths[i][-1][1]-curr_end[1])))
-                    p = paths.pop(i)
-                    stitched.extend(p if np.hypot(p[0][0]-curr_end[0], p[0][1]-curr_end[1]) <= np.hypot(p[-1][0]-curr_end[0], p[-1][1]-curr_end[1]) else p[::-1])
-            
-            # REMOVED old is_closed logic. Just return the array.
-            return [tuple(x) for x in stitched]
+            joined = self._join_dxf_paths(paths, self.DXF_JOIN_TOLERANCE_MM)
+            return self._trace_dxf_paths(joined)
             
         except Exception as e:
             print(f"Failed to parse DXF: {e}")

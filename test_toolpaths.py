@@ -44,5 +44,50 @@ class ToolpathSynchronizationTests(unittest.TestCase):
         self.assertGreater(synced_b[2][0], synced_b[2][1])
 
 
+class DxfToolpathTests(unittest.TestCase):
+    def setUp(self):
+        self.controller = wwcutter.HotWireController.__new__(wwcutter.HotWireController)
+
+    @staticmethod
+    def path_length(points):
+        return sum(np.hypot(end[0] - start[0], end[1] - start[1])
+                   for start, end in zip(points, points[1:]))
+
+    def test_entry_line_connects_contours_without_synthetic_bridges(self):
+        outer = [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)]
+        hole = [(4, 4), (6, 4), (6, 6), (4, 6), (4, 4)]
+        entry = [(0, 5), (4, 5)]
+
+        joined = self.controller._join_dxf_paths(
+            [outer, hole, entry], self.controller.DXF_JOIN_TOLERANCE_MM)
+        toolpath = self.controller._trace_dxf_paths(joined)
+
+        self.assertTrue(np.allclose(toolpath[0], toolpath[-1]))
+        # 40 mm outer + 8 mm hole + the 4 mm entry travelled in and out.
+        self.assertAlmostEqual(self.path_length(toolpath), 56.0, places=7)
+        entry_uses = sum(
+            (np.allclose(start, (0, 5)) and np.allclose(end, (4, 5))) or
+            (np.allclose(start, (4, 5)) and np.allclose(end, (0, 5)))
+            for start, end in zip(toolpath, toolpath[1:]))
+        self.assertEqual(entry_uses, 2)
+
+    def test_positioning_point_is_the_real_cut_start(self):
+        points = [(0, 0), (10, 0), (10, 5), (0, 5), (0, 0)]
+
+        processed = self.controller.process_toolpath(points, 0)
+
+        self.assertEqual(processed[0], processed[1])
+        self.assertAlmostEqual(self.path_length(processed), self.path_length(points), places=7)
+
+    def test_dense_contour_does_not_depend_on_python_recursion_depth(self):
+        angles = np.linspace(0.0, 2.0 * np.pi, 1501)
+        contour = list(zip(np.cos(angles), np.sin(angles)))
+
+        toolpath = self.controller._trace_dxf_paths([contour])
+
+        self.assertEqual(len(toolpath), len(contour))
+        self.assertTrue(np.allclose(toolpath[0], toolpath[-1]))
+
+
 if __name__ == "__main__":
     unittest.main()
